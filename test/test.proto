@@ -4,6 +4,9 @@ package protobson.test;
 
 option go_package = "github.com/ThePib/taalapi/pkg/database/protobson/test";
 
+import "google/protobuf/struct.proto";
+import "google/protobuf/any.proto";
+
 enum Enum {
   VAL_0 = 0;
   VAL_1 = 17;
@@ -33,6 +36,18 @@ message RepeatedFieldMessage {
 message MessageWithMap {
   string string_field = 1;
   map<int32, string> map_field = 2;
+}
+
+message MessageWithOptional {
+  optional string string_field = 1;
+}
+
+message MessageWithStruct {
+  google.protobuf.Struct struct_field = 1;
+}
+
+message MessageWithAny {
+  google.protobuf.Any any_field = 1;
 }
 
 message MessageWithSubMessageMap {

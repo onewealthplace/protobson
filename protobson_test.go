@@ -1,6 +1,8 @@
 package protobson
 
 import (
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"reflect"
 	"testing"
 
@@ -9,6 +11,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var structField, _ = structpb.NewStruct(map[string]interface{}{
+	"hello": "world",
+})
+var anyField, _ = anypb.New(&pb_test.MessageWithMap{
+	StringField: "foo",
+	MapField:    map[int32]string{123: "bar"},
+})
 var (
 	tests = []struct {
 		name          string
@@ -66,6 +75,27 @@ var (
 			pb: &pb_test.MessageWithMap{
 				StringField: "foo",
 				MapField:    map[int32]string{123: "bar"},
+			},
+			equivalentPbs: []proto.Message{},
+		},
+		{
+			name: "message with optional",
+			pb: &pb_test.MessageWithOptional{
+				StringField: nil,
+			},
+			equivalentPbs: []proto.Message{},
+		},
+		{
+			name: "message with struct",
+			pb: &pb_test.MessageWithStruct{
+				StructField: structField,
+			},
+			equivalentPbs: []proto.Message{},
+		},
+		{
+			name: "message with any",
+			pb: &pb_test.MessageWithAny{
+				AnyField: anyField,
 			},
 			equivalentPbs: []proto.Message{},
 		},

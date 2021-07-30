@@ -1,20 +1,13 @@
 package protobson
 
 import (
-	"fmt"
-	"reflect"
-	"strconv"
-	"strings"
-
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/bson/bsonrw"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
-)
-
-const (
-	fieldPrefix = "pb_field_"
+	"reflect"
+	"strings"
 )
 
 type protobufCodec struct{}
@@ -38,60 +31,79 @@ func (pc *protobufCodec) DecodeValue(dctx bsoncodec.DecodeContext, vr bsonrw.Val
 
 	protoMsg := val.Interface().(proto.Message)
 	msg := protoMsg.ProtoReflect()
+	for val.Kind() != reflect.Struct {
+		val = val.Elem()
+	}
+	jsonTags := fieldByTag(val.Type())
 	for name, vr, err := dr.ReadElement(); err != bsonrw.ErrEOD; name, vr, err = dr.ReadElement() {
 		if err != nil {
 			return err
 		}
-		if !strings.HasPrefix(name, fieldPrefix) {
-			if err = vr.Skip(); err != nil {
-				return err
-			}
-			continue
-		}
-		n, err := strconv.Atoi(elementNameToFieldNumber(name))
-		if err != nil {
-			return err
-		}
-		num := protoreflect.FieldNumber(n)
-		fd := msg.Descriptor().Fields().ByNumber(num)
-		// Skip elements representing a field that is not part of the Protobuf message.
+		fd := msg.Descriptor().Fields().ByJSONName(name)
 		if fd == nil {
-			if err = vr.Skip(); err != nil {
+			field, hasField := jsonTags[name]
+			if !hasField {
+				if err = vr.Skip(); err != nil {
+					return err
+				}
+				continue
+			}
+			dec, err := dctx.LookupDecoder(field.Type)
+			if err != nil {
 				return err
 			}
-			continue
-		}
-		fv := msg.NewField(fd)
+			if err = dec.DecodeValue(dctx, vr, val.FieldByName(field.Name)); err != nil {
+				return err
+			}
+		} else {
+			fv := msg.NewField(fd)
 
-		// This boolean is used to toggle previous message definition emulation
-		// in the decode function.
-		// Protobuf specification allows turning a repeated message field into a non-repeated one,
-		// and vice-versa, without breaking backwards compatibility.
-		// Therefore, if a message with an updated definition containing such change is given as target,
-		// a normal decode will fail, and another attempt is made with emulation of previous message definition
-		// (i.e. wrap and unwrap fields as necessary). This boolean is used to toggle emulation behavior.
-		var emulate bool
+			// This boolean is used to toggle previous message definition emulation
+			// in the decode function.
+			// Protobuf specification allows turning a repeated message field into a non-repeated one,
+			// and vice-versa, without breaking backwards compatibility.
+			// Therefore, if a message with an updated definition containing such change is given as target,
+			// a normal decode will fail, and another attempt is made with emulation of previous message definition
+			// (i.e. wrap and unwrap fields as necessary). This boolean is used to toggle emulation behavior.
+			var emulate bool
 
-		// Try to decode without previous message definition emulation first.
-		if err = decodeField(dctx, vr, fd, &fv, emulate); err == nil {
+			// Try to decode without previous message definition emulation first.
+			if err = decodeField(dctx, vr, fd, &fv, emulate); err == nil {
+				msg.Set(fd, fv)
+				continue
+			}
+			origErr := err
+
+			// Since initial decode attempt failed, try to decode again with previous message definition emulation.
+			// If this attempt also fails, the original decode error is returned.
+			emulate = true
+			if err = decodeField(dctx, vr, fd, &fv, emulate); err != nil {
+				return origErr
+			}
 			msg.Set(fd, fv)
-			continue
 		}
-		origErr := err
-
-		// Since initial decode attempt failed, try to decode again with previous message definition emulation.
-		// If this attempt also fails, the original decode error is returned.
-		emulate = true
-		if err = decodeField(dctx, vr, fd, &fv, emulate); err != nil {
-			return origErr
-		}
-		msg.Set(fd, fv)
 	}
 	return nil
 }
 
+func fieldByTag(msgType reflect.Type) map[string]reflect.StructField {
+	var out = map[string]reflect.StructField{}
+	num := msgType.NumField()
+	for i := 0; i < num; i++ {
+		field := msgType.Field(i)
+		jsonTag, hasJsonTag := field.Tag.Lookup("json")
+		if !hasJsonTag {
+			continue
+		}
+		jsonName := strings.Split(jsonTag, ",")[0]
+		out[jsonName] = field
+	}
+	return out
+}
+
 func (pc *protobufCodec) EncodeValue(ectx bsoncodec.EncodeContext, vw bsonrw.ValueWriter, val reflect.Value) error {
 	protoMsg := val.Interface().(proto.Message)
+	protoReflect := protoMsg.ProtoReflect()
 	for val.Kind() != reflect.Struct {
 		val = val.Elem()
 	}
@@ -101,22 +113,44 @@ func (pc *protobufCodec) EncodeValue(ectx bsoncodec.EncodeContext, vw bsonrw.Val
 		return err
 	}
 
-	protoMsg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, fv protoreflect.Value) bool {
+	numberOfFields := val.NumField()
+	protoFields := protoReflect.Descriptor().Fields()
+	protoReflect.Range(func(fd protoreflect.FieldDescriptor, fv protoreflect.Value) bool {
 		if err = encodeField(ectx, dw, fd, &fv); err != nil {
 			return false
 		}
 		return true
 	})
+	for i := 0; i < numberOfFields; i++ {
+		field := val.Type().Field(i)
+		jsonTag, hasJsonTag := field.Tag.Lookup("json")
+		if !hasJsonTag {
+			continue
+		}
+		protoField := protoFields.ByName(protoreflect.Name(field.Name))
+		if protoField == nil {
+			enc, err := ectx.LookupEncoder(field.Type)
+			if err != nil {
+				return err
+			}
+
+			jsonName := strings.Split(jsonTag, ",")[0]
+			vw, err := dw.WriteDocumentElement(jsonName)
+			if err != nil {
+				return err
+			}
+			err = enc.EncodeValue(ectx, vw, val.Field(i))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	if err != nil {
 		return err
 	}
 
 	return dw.WriteDocumentEnd()
-}
-
-// FieldNumberToElementName returns the BSON-encoded field name corresponding to Protobuf message field number.
-func FieldNumberToElementName(num protoreflect.FieldNumber) string {
-	return fmt.Sprintf("%v%v", fieldPrefix, num)
 }
 
 func decodeField(dctx bsoncodec.DecodeContext, vr bsonrw.ValueReader, fd protoreflect.FieldDescriptor, dst *protoreflect.Value, emul bool) error {
@@ -191,10 +225,6 @@ func decodeField(dctx bsoncodec.DecodeContext, vr bsonrw.ValueReader, fd protore
 	return nil
 }
 
-func elementNameToFieldNumber(name string) string {
-	return strings.Replace(name, fieldPrefix, "", 1)
-}
-
 func encodeField(ectx bsoncodec.EncodeContext, dw bsonrw.DocumentWriter, fd protoreflect.FieldDescriptor, src *protoreflect.Value) error {
 	var val reflect.Value
 	if fd.IsList() {
@@ -231,7 +261,7 @@ func encodeField(ectx bsoncodec.EncodeContext, dw bsonrw.DocumentWriter, fd prot
 		return err
 	}
 
-	vw, err := dw.WriteDocumentElement(FieldNumberToElementName(fd.Number()))
+	vw, err := dw.WriteDocumentElement(fd.JSONName())
 	if err != nil {
 		return err
 	}
